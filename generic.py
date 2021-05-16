@@ -38,12 +38,6 @@ def iter_filelist(filelist: Path) -> Generator[Path, None, None]:
 
 def iter_collect_files(*args: Union[Path, None]) -> Generator[Path, None, None]:
     for path in args:
-        # if arg and not isinstance(arg, list):
-        #     print(arg)
-        #     raise TypeError("expecting a list")
-        # if not arg:
-        #     continue
-        # for path in arg:
         if not path:
             continue
         if glob.has_magic(str(path)):
@@ -59,9 +53,6 @@ def iter_collect_files(*args: Union[Path, None]) -> Generator[Path, None, None]:
 
 
 def collect_files(*args: Path, _filter=None) -> list:
-    # if _filter is None:
-    #     def _filter(path: Path) -> bool:
-    #         return path.suffix in (".vpp", ".mako") and path.exists()
     if _filter is None:
         return list(iter_collect_files(*args))
     return list(filter(_filter, iter_collect_files(*args)))

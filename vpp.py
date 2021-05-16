@@ -1,5 +1,5 @@
 from generic import iter_collect_files
-from monitors import FileMonitor, REMOVED, MODIFIED
+from monitors import FileMonitor, REMOVED
 from inspect import getmembers, isfunction
 from ast import literal_eval
 from pathlib import Path
@@ -16,6 +16,7 @@ import yaml
 import sys
 import filters
 import argparse
+import tempfile
 
 
 class ComputedError(Exception):
@@ -54,8 +55,8 @@ def parse_args() -> argparse.Namespace:
         if not pathname:
             return None
         path = Path(os.path.expandvars(pathname)).expanduser().resolve()
-        if path.is_file() and path.suffix != ".tpp":
-            raise ExtensionError(path)
+        # if path.is_file() and path.suffix != ".tpp":
+        #     raise ExtensionError(path)
         return path
 
     parser = argparse.ArgumentParser()
@@ -101,7 +102,7 @@ def parse_args() -> argparse.Namespace:
         "--dev",
         action="store_true",
         default=False,
-        help="running at development mode, which will render any template if it had been modified",
+        help="running at development mode, which will render any template if it have been modified",
     )
     parser.add_argument(
         "-v",
@@ -114,33 +115,35 @@ def parse_args() -> argparse.Namespace:
 
 
 def render(
-    template: Path,
+    uri: Path,
     output_directory: Path,
     _globals: dict,
     logger: logging.Logger = None,
     lookup: TemplateLookup = None,
 ):
-    if not template.suffix == ".tpp":
-        raise ExtensionError(template)
+    if uri.suffix != ".tpp":
+        raise ExtensionError(uri)
 
     try:
         tmp = Template(
-            filename=str(template),
+            # note that must use text instead of filename
+            # if lookup template locates at different folder
+            uri.open().read(),
+            uri=uri.name,
             preprocessor=tpp_preprocessor,
             lookup=lookup,
+            # module_directory=lookup.module_directory,
         )
-
-        out = output_directory.joinpath(template.stem)
+        out = output_directory.joinpath(uri.stem)
         msg = f"{'generated'} | {out}"
         with out.open("w") as fo:
             fo.write(tmp.render(store={}, **_globals))
-            logger.info(msg) if logger else print(msg)
+        logger.info(msg) if logger else print(msg)
     except:
         sep = "\n  "
         errors = ["  "]
         traceback = exceptions.RichTraceback()
         for (filename, lineno, function, line) in traceback.traceback:
-            # if filename == str(template):
             errors.append("File %s, line %s, in %s" % (filename, lineno, function))
             errors.append(line)
         errors.append(
@@ -191,58 +194,48 @@ def main():
     output_directory.mkdir(parents=True, exist_ok=True)
 
     sources = argv.filelist + argv.pathnames
-    ### render templates
-    lookup = (
-        TemplateLookup(
-            directories=["lookup/"],
-            preprocessor=tpp_preprocessor,
-            module_directory="./tmp",
-        )
-        if argv.incdir
-        else None
-    )
-    x = lookup.get_template("header.txt")
-    print(x)
-    for f in iter_collect_files(*sources):
-        # lookup.put_template(
-        #     f.name,
-        #     template=Template(
-        #         module_directory="./tmp",
-        #         filename=str(f.relative_to(Path.cwd())),
-        #         preprocessor=tpp_preprocessor,
-        #         lookup=lookup,
-        #     ),
-        # )
-        lookup.put_string(f.name, f.open().read())
-    print(lookup._collection)
 
     def render_all():
         for filename in iter_collect_files(*sources):
-            # render(
-            #     filename, output_directory, _globals, lookup=lookup, logger=root_logger
-            # )
-            x = lookup.get_template(filename.name)
-            print(x)
-            x.render(store={}, **_globals)
+            render(
+                filename, output_directory, _globals, lookup=lookup, logger=root_logger
+            )
 
-    render_all()  # always render all once
+    ### render templates
+    with tempfile.TemporaryDirectory(prefix=".tmpdir_", dir=Path.cwd()) as tmpdir:
+        lookup = (
+            TemplateLookup(
+                directories=list(map(str, argv.incdir)),
+                preprocessor=tpp_preprocessor,
+                module_directory=tmpdir,
+            )
+            if argv.incdir
+            else None
+        )
 
-    if argv.dev:
+        render_all()  # always render all once
+        if not argv.dev:
+            return
         filemonitor = FileMonitor(*sources)
         lookup_monitor = FileMonitor(*argv.incdir)
         print('Running at development mode. Use "ctrl+c" to exit.')
         while True:
             try:
-                for event, _ in lookup_monitor.iter_diff(verbose=False):
+                for event, filename in lookup_monitor.iter_diff(verbose=False):
+                    root_logger.info(f"{event} | {filename}")
                     if event != REMOVED:
                         render_all()
                         break
                 for event, filename in filemonitor.iter_diff(verbose=False):
                     root_logger.info(f"{event} | {filename}")
-                    if event != REMOVED:
+                    if event == REMOVED:
                         continue
                     render(
-                        Path(filename), output_directory, _globals, logger=root_logger
+                        filename,
+                        output_directory,
+                        _globals,
+                        lookup=lookup,
+                        logger=root_logger,
                     )
                 time.sleep(1)
             except KeyboardInterrupt:

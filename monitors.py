@@ -48,6 +48,10 @@ class MonitorBase:
             self.logger.error(f"No such file or directory: {target}")
             return False
 
+        if target.name[0] == ".":
+            # ignore hidden files
+            return False
+
         return True
 
     def get_status(self) -> Mapping[str, float]:
@@ -85,10 +89,5 @@ class MonitorBase:
 
 
 class FileMonitor(MonitorBase):
-    def filter_target(self, target: Path):
-        if not target.suffix == ".tpp":
-            return False
-        return super().filter_target(target)
-
     def get_status(self) -> Mapping[str, float]:
         return dict([(str(path), path.stat().st_mtime) for path in self.targets])

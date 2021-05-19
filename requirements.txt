@@ -1,0 +1,5 @@
+anytree==2.8.0
+Mako==1.1.4
+MarkupSafe==1.1.1
+PyYAML==5.4.1
+six==1.16.0

@@ -1,4 +1,4 @@
-from typing import Generator, List, Union
+from typing import Generator, List, Optional, Union
 from pathlib import Path
 import re
 import os
@@ -36,7 +36,7 @@ def iter_filelist(filelist: Path) -> Generator[Path, None, None]:
                     yield Path(token)
 
 
-def iter_collect_files(*args: Union[Path, None]) -> Generator[Path, None, None]:
+def iter_collect_files(*args: Optional[Path]) -> Generator[Path, None, None]:
     for path in args:
         if not path:
             continue
@@ -52,7 +52,7 @@ def iter_collect_files(*args: Union[Path, None]) -> Generator[Path, None, None]:
             yield path
 
 
-def collect_files(*args: Path, _filter=None) -> list:
+def collect_files(*args: Optional[Path], _filter=None) -> list:
     if _filter is None:
         return list(iter_collect_files(*args))
     return list(filter(_filter, iter_collect_files(*args)))

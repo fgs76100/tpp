@@ -1,0 +1,9 @@
+.venv
+*.log
+*.sv*
+lookup
+templates
+test
+__pycache__
+*.swp
+*.yaml

@@ -197,11 +197,6 @@ def main():
 
     sources = argv.filelist + argv.pathnames
 
-    def render_all():
-        for filename in iter_collect_files(*sources):
-            render(
-                filename, output_directory, _globals, lookup=lookup, logger=root_logger
-            )
 
     ### render templates
     with tempfile.TemporaryDirectory(prefix=".tmpdir_", dir=Path.cwd()) as tmpdir:
@@ -214,6 +209,11 @@ def main():
             if argv.incdir
             else None
         )
+        def render_all():
+            for filename in iter_collect_files(*sources):
+                render(
+                    filename, output_directory, _globals, lookup=lookup, logger=root_logger
+                )
 
         render_all()  # always render all once
         if not argv.dev:

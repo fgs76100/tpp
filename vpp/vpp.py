@@ -1,31 +1,50 @@
 #!/usr/bin/env python3
 
+from copy import deepcopy
 import os
+import re
 
 from pathlib import Path
 from fnmatch import fnmatch
-from typing import Union, Callable, Generator
+from typing import (
+    Iterator,
+    TypedDict,
+    Union,
+    Callable,
+    List,
+    Dict,
+    Optional,
+)
 from .core import (
     VerilogModuleParser,
     VerilogModulePort,
     VerilogPreprocessor,
-    verible_verilog_parser,
+    get_verible_verilog_parser,
+    USER_DEFINED_FUNCTIONS,
+    PARAMS,
 )
 from .verible_verilog_syntax import BranchNode
 
-INDENT = 2
-UNCONNECTED = 0
-INTERFACE = 1
+INDENT: int = 2
+UNCONNECTED: int = 0
+INTERFACE: int = 1
+IO_CONNECT = Union[Dict[str, str], Callable[[str], Optional[str]]]
 
 
-def rename(string: str, repl: Union[dict, Callable]):
+def connect(string: str, repl: IO_CONNECT) -> Optional[str]:
+    new = None
     if callable(repl):
         new = repl(string)
-    elif repl and isinstance(repl, dict):
-        new = repl.get(string, string)
-    else:
-        new = string
+    elif isinstance(repl, dict):
+        new = repl.get(string, None)
     return new
+
+
+class IO(TypedDict, total=False):
+    mode: int
+    suffix: str
+    prefix: str
+    connect: IO_CONNECT
 
 
 class VerilogModule(VerilogModuleParser):
@@ -33,79 +52,82 @@ class VerilogModule(VerilogModuleParser):
         self,
         file_path: str,
         module_tree: BranchNode,
-        defines: dict = None,
-        params: dict = None,
-        io_suffix: str = "",
-        io_prefix: str = "",
-        io_mode: int = INTERFACE,
-        io_conn: dict = None,
+        defines: PARAMS = None,
+        params: PARAMS = None,
+        user_defined_functions: USER_DEFINED_FUNCTIONS = None,
+        io: IO = None,
     ):
-        super().__init__(file_path, module_tree, defines, params)
+        self.params_redefined = params.copy() if isinstance(params, dict) else {}
         self.instance_counts = 0
-        self.io_conn = io_conn or {}
-        self.io_suffix = io_suffix
-        self.io_prefix = io_prefix
-        self.set_io_mode(io_mode)
-        # self.user_params = user_params or {}
+        self.io: IO = dict(mode=INTERFACE, suffix="", prefix="", conn={})
+        if isinstance(io, dict):
+            self.io.update(deepcopy(io))
+        super().__init__(
+            file_path, module_tree, defines, params, user_defined_functions
+        )
 
-    def set_io_mode(self, mode: str):
+    def set_io_mode(self, mode: int):
         modes = (INTERFACE, UNCONNECTED)
         if mode not in modes:
             raise ValueError(f"Only support following modes: {modes}")
-        self.io_mode = mode
+        self.io["mode"] = mode
 
-    def set_io_conn(self, io_conn: Union[dict, Callable]):
-        self.io_conn = io_conn
+    def set_io_connect(self, connect: IO_CONNECT):
+        self.io["connect"] = connect
 
     def set_io_suffix(self, suffix: str):
-        self.io_suffix = suffix
+        self.io["suffix"] = suffix
 
     def set_io_prefix(self, prefix: str):
-        self.io_prefix = prefix
+        self.io["prefix"] = prefix
 
     def iter_ports(
         self,
-        io_conn: Union[dict, Callable] = None,
-        prefix: str = None,
-        suffix: str = None,
-        ignores: list = None,
-        match: Union[str, Callable] = None,
-    ) -> Generator[VerilogModulePort, None, None]:
+        io: IO = None,
+        ignores: List[str] = None,
+        match: Union[str, Callable[[str], bool]] = None,
+        regxp: bool = False,
+    ) -> Iterator[VerilogModulePort]:
 
-        io_conn = self.io_conn if io_conn is None else io_conn
-        suffix = self.io_suffix if suffix is None else suffix
-        prefix = self.io_prefix if prefix is None else prefix
+        io = {**self.io, **io} if isinstance(io, dict) else self.io
+        io_connect = io["connect"]
+        io_suffix = io["suffix"]
+        io_prefix = io["prefix"]
+        io_mode = io["mode"]
 
-        for port_name in io_conn:
-            if port_name not in self.ports:
-                raise ValueError(
-                    f'No such port name "{port_name}" on the module "{self.module_name}"'
-                )
+        # if isinstance(io, dict):
+        #     for port_name, wire_name in io_connect.items():
+        #         if port_name not in self.ports:
+        #             raise ValueError(
+        #                 f'No such port name "{port_name}" on the module "{self.module_name}"'
+        #             )
+        #         else:
+        #             self.ports[port_name].conn(wire_name)
 
         for port in self.ports.values():
             if ignores and port.name in ignores:
                 continue
-
             if callable(match) and not match(port.name):
                 continue
-
-            if match and isinstance(match, str):
-                if not fnmatch(port.name, match):
+            if isinstance(match, str):
+                if not regxp and not fnmatch(port.name, match):
+                    continue
+                if regxp and not re.match(match, port.name):
                     continue
 
-            wire_name = rename(port.name, repl=io_conn)
-            if wire_name != port.name:
+            wire_name = connect(port.name, repl=io_connect)
+            if wire_name is not None:
                 port.conn(wire_name)
             else:
                 port.unconn()
-                if self.io_mode == INTERFACE:
-                    port.wire_name = f"{prefix}{port.name}{suffix}"
+                if io_mode == INTERFACE:
+                    port.wire_name = f"{io_prefix}{port.name}{io_suffix}"
                 else:
                     port.wire_name = f"NC__{port.name}"
 
             yield port
 
-    def iter_declarations(self, data_type: str, ignores: list = None):
+    def iter_declarations(self, data_type: str, ignores: List[str] = None):
         max_len_dimension = max(
             map(
                 lambda x: len(str(x.data_type.to_declaration(data_type))),
@@ -114,7 +136,7 @@ class VerilogModule(VerilogModuleParser):
         )
         for port in self.iter_ports(ignores=ignores):
             if (
-                self.io_mode == UNCONNECTED
+                self.io["mode"] == UNCONNECTED
                 and port.direction == "input"
                 and port.is_unconnected
             ):
@@ -122,21 +144,22 @@ class VerilogModule(VerilogModuleParser):
             else:
                 yield f"{port.to_declaration(data_type, max_len_dimension)};"
 
-    def io_to_wires(self, ignores: list = None):
+    def io_to_wires(self, ignores: List[str] = None) -> str:
         return "\n".join(self.iter_declarations("wire", ignores))
 
-    def io_to_logics(self, ignores: list = None):
+    def io_to_logics(self, ignores: List[str] = None) -> str:
         return "\n".join(self.iter_declarations("logic", ignores))
 
     def render_interface(
         self,
-        indent=INDENT,
-        io_conn: Union[dict, Callable] = None,
-        suffix: str = None,
-        prefix: str = None,
+        indent: int = INDENT,
+        io: IO = None,
         include_connected=False,
-        ignores: list = None,
+        ignores: List[str] = None,
     ) -> str:
+        io_mode = (
+            io.get("mode", self.io["mode"]) if isinstance(io, dict) else self.io["mode"]
+        )
         indent = indent * " "
         sep = ",\n"
         max_len_dir = max(map(lambda x: len(x.direction), self.ports.values())) + 2
@@ -145,13 +168,13 @@ class VerilogModule(VerilogModuleParser):
             f"{indent}{port.direction:<{max_len_dir}} "
             f"{port.data_type:<{max_len_dim}} "
             f"{port.get_wire_name()}"
-            for port in self.iter_ports(io_conn, prefix, suffix, ignores)
-            if (port.is_unconnected and self.io_mode == INTERFACE)
+            for port in self.iter_ports(io=io, ignores=ignores)
+            if (port.is_unconnected and io_mode == INTERFACE)
             or (include_connected and not port.is_unconnected)
         )
         return ports
 
-    def render_params(self, indent=INDENT) -> str:
+    def render_params(self, indent: int = INDENT) -> str:
         indent = indent * " "
         sep = ",\n"
         params = sep.join(
@@ -161,27 +184,23 @@ class VerilogModule(VerilogModuleParser):
 
     def render_moduleHeader(
         self,
-        indent=INDENT,
-        io_conn: Union[dict, Callable] = None,
-        prefix: str = None,
-        suffix: str = None,
-        include_connected=False,
+        indent: int = INDENT,
+        io: IO = None,
+        include_connected: bool = False,
     ) -> str:
         return (
             f"module {self.module_name} #(\n"
             f"{self.render_params(indent)}\n"
             f") (\n"
-            f"{self.render_interface(indent, io_conn=io_conn, prefix=prefix, suffix=suffix, include_connected=include_connected)}\n"
+            f"{self.render_interface(indent, io=io, include_connected=include_connected)}\n"
             f");\n"
         )
 
     def render_port_connections(
         self,
         indent: int = INDENT,
-        io_conn: dict = None,
-        suffix: str = None,
-        prefix: str = None,
-        ignores: list = None,
+        io: IO = None,
+        ignores: List[str] = None,
     ) -> str:
 
         _indent = indent * " "
@@ -190,16 +209,14 @@ class VerilogModule(VerilogModuleParser):
         max_len_wire = max(
             map(
                 lambda x: len(x.get_wire_name()),
-                self.iter_ports(io_conn, prefix, suffix),
+                self.iter_ports(io=io),
             )
         )
 
         ports = sep.join(
             f"{_indent}.{port.name:<{ max_len_name +2}}"
             f"({port.get_wire_name():<{ max_len_wire +2}}) /* {port} */"
-            for port in self.iter_ports(
-                io_conn=io_conn, suffix=suffix, prefix=prefix, ignores=ignores
-            )
+            for port in self.iter_ports(io=io, ignores=ignores)
         )
         return ports
 
@@ -207,13 +224,11 @@ class VerilogModule(VerilogModuleParser):
         self,
         instnace_name: str = None,
         indent: int = INDENT,
-        suffix: str = None,
-        prefix: str = None,
         params: dict = None,
-        io_conn: Union[dict, Callable] = None,
+        io: IO = None,
     ) -> str:
         _indent = indent * " "
-        params = params or ""
+        params = params or self.params_redefined
 
         if params and isinstance(params, dict):
             params = ",\n".join(f"{_indent}.{k}({v})" for k, v in params.items())
@@ -224,30 +239,102 @@ class VerilogModule(VerilogModuleParser):
             self.instance_counts += 1
 
         ports = self.render_port_connections(
+            io=io,
             indent=indent,
-            suffix=suffix,
-            prefix=prefix,
-            io_conn=io_conn,
         )
 
         return f"{self.module_name} {params}{instnace_name} (\n" f"{ports}\n" f");\n"
 
     @classmethod
-    def from_file(cls, filename: str, modulename: str = None, params: dict = None):
+    def from_file(
+        cls,
+        filename: str,
+        modulename: str = None,
+        params: PARAMS = None,
+        defines: PARAMS = None,
+        user_defined_functions: USER_DEFINED_FUNCTIONS = None,
+        io: IO = None,
+    ) -> "VerilogModule":
         filepath = Path(os.path.expandvars(filename)).expanduser().resolve()
         if not filepath.exists():
             raise FileNotFoundError(filepath)
         if modulename is None:
             modulename = filepath.stem
 
-        file_data = verible_verilog_parser(str(filepath))
-        pp = VerilogPreprocessor(str(filepath), file_data)
+        parser = get_verible_verilog_parser()
+        file_data = parser.parse_file(
+            str(filepath), {"skip_null": True, "gen_rawtokens": False}
+        )
+        pp = VerilogPreprocessor(file_data, defines=defines)
         for module in pp.walk_root():
             _, name = cls.get_module_header_and_name(module)
             if modulename == name:
-                module = cls(str(filepath), module, pp.defines, params)
+                module = cls(
+                    str(filepath),
+                    module,
+                    defines=pp.defines,
+                    params=params,
+                    user_defined_functions=user_defined_functions,
+                    io=io,
+                )
                 return module
         else:
             raise ValueError(
                 f"No such module name: {modulename} in the file 'f{filepath}'"
             )
+
+    @classmethod
+    def iter_from_string(
+        cls,
+        string: str,
+        modulename: str = None,
+        params: PARAMS = None,
+        defines: PARAMS = None,
+        user_defined_functions: USER_DEFINED_FUNCTIONS = None,
+        io: IO = None,
+    ):
+        parser = get_verible_verilog_parser()
+        file_data = parser.parse_string(
+            string, {"skip_null": True, "gen_rawtokens": False}
+        )
+        pp = VerilogPreprocessor(file_data, defines)
+        for module in pp.walk_root():
+            if modulename:
+                _, name = cls.get_module_header_and_name(module)
+            else:
+                name = modulename
+            if modulename == name:
+                yield cls(
+                    "from_string",
+                    module,
+                    defines=pp.defines,
+                    params=params,
+                    user_defined_functions=user_defined_functions,
+                    io=io,
+                )
+                if modulename:
+                    break
+        else:
+            if modulename:
+                raise ValueError(f"No such module name: {modulename}")
+
+    @classmethod
+    def from_string(
+        cls,
+        string: str,
+        modulename: str = None,
+        params: PARAMS = None,
+        defines: PARAMS = None,
+        user_defined_functions: USER_DEFINED_FUNCTIONS = None,
+        io: IO = None,
+    ) -> List["VerilogModule"]:
+        return list(
+            cls.iter_from_string(
+                string,
+                modulename,
+                params=params,
+                defines=defines,
+                user_defined_functions=user_defined_functions,
+                io=io,
+            )
+        )

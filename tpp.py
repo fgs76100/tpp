@@ -7,6 +7,7 @@ from mako.template import Template
 from mako import exceptions
 from mako.lookup import TemplateLookup
 from vpp.vpp import VerilogModule
+from imports import ImportModulesMonitor
 
 # from mako import exceptions
 import logging
@@ -63,7 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "pathnames",
-        metavar="template or directory",
+        metavar="file or directory",
         nargs="*",
         type=path_wrapper,
         default=[],
@@ -92,18 +93,37 @@ def parse_args() -> argparse.Namespace:
         help="a filelist of templates",
     )
     parser.add_argument(
+        "-d",
+        "--define",
+        default=[],
+        action="append",
+        type=str,
+        metavar="DEFINE",
+        dest="defines",
+        help="specify global defines for verilog preprocessor",
+    )
+    parser.add_argument(
+        "--import",
+        default=[],
+        metavar="PYTHON FILE or PACKAGE",
+        action="append",
+        type=str,
+        dest="imports",
+        help="import python file or package",
+    )
+    parser.add_argument(
         "--incdir",
         default=[],
         metavar="DIRECTORY",
         action="append",
         type=path_wrapper,
-        help="specify a directory to lookup templates, which won't be rendered automatically.",
+        help="specify a directory to lookup module-level blocks",
     )
     parser.add_argument(
         "--dev",
         action="store_true",
         default=False,
-        help="running at development mode, which will render any template if it have been modified",
+        help="development mode which will keep running and render any template if it has been modified",
     )
     parser.add_argument(
         "-v",
@@ -121,6 +141,7 @@ def render(
     _globals: dict,
     logger: logging.Logger = None,
     lookup: TemplateLookup = None,
+    imports: list = None,
 ):
     if uri.suffix != ".tpp":
         raise ExtensionError(uri)
@@ -133,6 +154,8 @@ def render(
             uri=uri.name,
             preprocessor=tpp_preprocessor,
             lookup=lookup,
+            imports=imports,
+            strict_undefined=False,
             # module_directory=lookup.module_directory,
         )
         out = output_directory.joinpath(uri.stem)
@@ -196,7 +219,8 @@ def main():
     output_directory.mkdir(parents=True, exist_ok=True)
 
     sources = argv.filelist + argv.pathnames
-
+    imports = ImportModulesMonitor("\n".join(argv.imports))
+    _globals.update(imports.modules)
 
     ### render templates
     with tempfile.TemporaryDirectory(prefix=".tmpdir_", dir=Path.cwd()) as tmpdir:
@@ -205,14 +229,20 @@ def main():
                 directories=list(map(str, argv.incdir)),
                 preprocessor=tpp_preprocessor,
                 module_directory=tmpdir,
+                strict_undefined=False,
             )
             if argv.incdir
             else None
         )
+
         def render_all():
             for filename in iter_collect_files(*sources):
                 render(
-                    filename, output_directory, _globals, lookup=lookup, logger=root_logger
+                    filename,
+                    output_directory,
+                    _globals,
+                    lookup=lookup,
+                    logger=root_logger,
                 )
 
         render_all()  # always render all once
@@ -220,14 +250,19 @@ def main():
             return
         filemonitor = FileMonitor(*sources)
         lookup_monitor = FileMonitor(*argv.incdir)
+        # imports_monitor = FileMonitor(*imports.get_module_filepath(lambda x: Path(x)))
         print('Running at development mode. Use "ctrl+c" to exit.')
         while True:
             try:
+                if imports.reload_modules():
+                    render_all()
+
                 for event, filename in lookup_monitor.iter_diff(verbose=False):
                     root_logger.info(f"{event} | {filename}")
                     if event != REMOVED:
                         render_all()
                         break
+
                 for event, filename in filemonitor.iter_diff(verbose=False):
                     root_logger.info(f"{event} | {filename}")
                     if event == REMOVED:
@@ -243,6 +278,11 @@ def main():
             except KeyboardInterrupt:
                 print("\nBye :D\n")
                 return
+            except Exception as e:
+                root_logger.exception(
+                    f"{e}: Unexpected erros, please contact the author"
+                )
+                return 1
 
 
 if __name__ == "__main__":

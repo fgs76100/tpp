@@ -9,16 +9,18 @@ from .verible_verilog_syntax import (
     VeribleVerilogSyntax,
 )
 
-from copy import deepcopy
 import re
 import anytree
 import math
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Generator, Mapping, Optional, Tuple, Dict
+from typing import Callable, Generator, Iterator, Optional, Tuple, Dict, Union
 from types import ModuleType
+from inspect import getmembers, isfunction
 
 INDENT = 2
+USER_DEFINED_FUNCTIONS = Union[ModuleType, Dict[str, Callable]]
+PARAMS = Dict[str, Union[str, int]]
 
 IdentifierTag = {"tag": ["SymbolIdentifier", "EscapedIdentifier"]}
 verilog_number = re.compile(r"(\+-)?(\d)*'([hbodHBOD])?([0-9a-fA-F]+)")
@@ -28,28 +30,15 @@ remap_syntax = {
     "&&": "and",
     "||": "or",
 }
-remap_sysetmTF = {
-    "$clog2": "clog2",
-}
 
 UNCONNECTED = 0
 INTERFACE = 1
 
+remap_sysetmTF = {
+    "$clog2": "clog2",
+}
 
-def clog2(value):
-    value = float(value)
-    return math.ceil(math.log2(value))
-
-
-def eval_expr(expr):
-    if not expr:
-        return
-
-    expr = "".join(map(str, expr))
-    value = eval(expr)
-    if isinstance(value, float):
-        return math.ceil(value)
-    return value
+_globals = {"clog2": lambda value: math.ceil(math.log2(float(value)))}
 
 
 class DataType:
@@ -63,7 +52,7 @@ class DataType:
         else:
             self.dimensions = dimensions
 
-        self.default_width = default_width
+        # self.default_width = default_width
 
     def __repr__(self):
         return self.__str__()
@@ -186,7 +175,7 @@ class VerilogASTCompiler:
         self.defines = {}
 
     @staticmethod
-    def parse_number(iteral, dimension_width=None):
+    def parse_number(iteral, dimension_width: int = None):
         """
         iteral: verilog integer iteral
         dimension_width: the data_type width of a variable
@@ -233,7 +222,7 @@ class VerilogASTCompiler:
         elif fmt == "d":
             value = int(value)
         elif fmt == "":
-            # reg = '0 or '1 -> all bits of "reg" be zero or one
+            # reg = '0 or '1 -> all bits of "register" be zero or one
             # if data_type width is undefine, assume dimension_width = 1 (base on IEEE1800-2017)
             dimension_width = dimension_width or 1
             return int(value * dimension_width, 2)
@@ -245,21 +234,21 @@ class VerilogASTCompiler:
             raise ValueError(size)
         return int(binary[:size], 2)
 
-    def visit_pp_node(self, node, callback, tag):
+    def visit_pp_node(self, node: BranchNode) -> Generator[BranchNode, None, None]:
         if not node:
             return
         for child in node.children:
-            if child.tag == "kPreprocessorIfdefClause":
-                define_id = child.find({"tag": "PP_Identifier"}).text
-                match = define_id in self.defines
+            define_id = child.find({"tag": "PP_Identifier"})
+            if child.tag in ("kPreprocessorIfdefClause", "kPreprocessorElsifClause"):
+                match = define_id.text in self.defines
 
             elif child.tag == "kPreprocessorIfndefClause":
-                define_id = child.find({"tag": "PP_Identifier"}).text
-                match = define_id not in self.defines
+                # define_id = child.find({"tag": "PP_Identifier"}).text
+                match = define_id.text not in self.defines
 
-            elif child.tag == "kPreprocessorElsifClause":
-                define_id = child.find({"tag": "PP_Identifier"}).text
-                match = define_id in self.defines
+            # elif child.tag == "kPreprocessorElsifClause":
+            #     define_id = child.find({"tag": "PP_Identifier"}).text
+            #     match = define_id in self.defines
 
             elif child.tag == "kPreprocessorElseClause":
                 match = True
@@ -268,7 +257,8 @@ class VerilogASTCompiler:
 
             if match:
                 # yield from self._walk(child.find(tag))
-                yield from callback(child.find(tag))
+                # yield from callback(child.find(tag))
+                yield child
                 break
         return
 
@@ -280,10 +270,9 @@ class VerilogPreprocessor(VerilogASTCompiler):
     any preprocssor statements(or compiler directives) inside the module declaration will be ignored
     """
 
-    def __init__(self, file_path: str, data: SyntaxData):
-        self.file_path = file_path
+    def __init__(self, data: SyntaxData, defines: dict = None):
         self.data = data
-        self.defines = {}
+        self.defines = defines or {}
 
     def walk_root(self) -> Generator[BranchNode, None, None]:
         yield from self._walk(self.data.tree)
@@ -295,16 +284,18 @@ class VerilogPreprocessor(VerilogASTCompiler):
         for node in tree.children:
             if node.tag == "kPreprocessorDefine":
                 define_id = node.find({"tag": "PP_Identifier"}).text
-                define_value = node.find({"tag": "PP_define_body"}).text
+                define_value = node.find({"tag": "PP_define_body"}).text or ""
                 self.defines[define_id] = define_value
             elif node.tag == "kPreprocessorUndef":
                 # remove a define id
                 define_id = node.find({"tag": "PP_Identifier"}).text
                 del self.defines[define_id]
             elif node.tag == "kPreprocessorBalancedDescriptionItems":
-                yield from self.visit_pp_node(
-                    node, self._walk, {"tag": "kDescriptionList"}
-                )
+                # yield from self.visit_pp_node(
+                #     node, self._walk, {"tag": "kDescriptionList"}
+                # )
+                for child in self.visit_pp_node(node):
+                    yield from self._walk(child.find({"tag": "kDescriptionList"}))
 
             if node.tag == "kModuleDeclaration":
                 yield node
@@ -315,22 +306,45 @@ class VerilogModuleParser(VerilogASTCompiler):
         self,
         file_path: str,
         module_tree: BranchNode,
-        defines: dict = None,
-        params: dict = None,
-        user_defined_functions: ModuleType = None,
+        defines: PARAMS = None,
+        params: PARAMS = None,
+        user_defined_functions: USER_DEFINED_FUNCTIONS = None,
     ):
         self.file_path = file_path
         self.defines = defines or {}
         self.ports: Dict[str, VerilogModulePort] = {}
-        self.module_name = None
-        self.user_defined_functions = user_defined_functions
-        if params and isinstance(params, dict):
-            self.params = deepcopy(params)
+        self.module_name: str = None
+        if isinstance(user_defined_functions, ModuleType):
+            self.user_defined_functions = dict(
+                getmembers(user_defined_functions, isfunction)
+            )
+        elif isinstance(user_defined_functions, dict):
+            self.user_defined_functions = user_defined_functions.copy()
+        else:
+            raise NotImplementedError(
+                f"user_defined_functions should be a moulde or dict, got f{type(user_defined_functions)} instead"
+            )
+
+        if isinstance(params, dict):
+            self.params = params.copy()
         else:
             self.params = {}
+
         self.process_module_tree(module_tree)
 
-    def visit_conditional_expression(self, node):
+    def eval_expr(self, expr: str):
+        if not expr:
+            return
+        expr = "".join(map(str, expr))
+        try:
+            value = eval(expr, _globals, self.user_defined_functions)
+        except SyntaxError:
+            raise SyntaxError(expr)
+        if isinstance(value, float):
+            return math.ceil(value)
+        return value
+
+    def visit_conditional_expression(self, node: BranchNode):
         # conditional_expression ::=
         # cond_predicate ? { attribute_instance  } expression : expression
         expr = []
@@ -338,7 +352,7 @@ class VerilogModuleParser(VerilogASTCompiler):
             if isinstance(child, TokenNode):
                 continue
             node = self.parse_expression(child)
-            expr.append(eval_expr(node))
+            expr.append(self.eval_expr(node))
 
         assert len(expr) == 3, "expecting [cond_predicate, expression, expression]"
         cond_predicate = expr[0]
@@ -349,70 +363,70 @@ class VerilogModuleParser(VerilogASTCompiler):
         right_expr = expr[2]
         return left_expr if cond_predicate else right_expr
 
-    def visit_dimension_range(self, node):
+    def visit_dimension_range(self, node: BranchNode):
         if not node:
             return
         for child in node.children:
             if isinstance(child, TokenNode):
                 continue
             node = self.parse_expression(child)
-            yield eval_expr(node)
+            yield self.eval_expr(node)
 
-    def parse_parameter(self, node):
+    def parse_parameter(self, node: BranchNode):
         name = node.find(IdentifierTag).text
         dimension = node.find({"tag": "kDeclarationDimensions"})
         data_type = DataType("", list(self.parse_expression(dimension)), 32)
 
         expression = node.find({"tag": "kExpression"})
-        value = eval_expr(self.parse_expression(expression, data_type.width))
+        value = self.eval_expr(self.parse_expression(expression, data_type.width))
         return name, value
 
-    def visit_func_call(self, node):
+    def visit_func_call(self, node: BranchNode):
         if node.tag == "kSystemTFCall":
             func = node.find({"tag": "SystemTFIdentifier"}).text
             func = remap_sysetmTF.get(func, None)
         if node.tag == "kFunctionCall":
             func = node.find(IdentifierTag).text
-            if hasattr(self.user_defined_functions, func):
-                func = f"user_defined_functions.{func}"
-            else:
+            if func not in self.user_defined_functions:
                 func = None
-
         if func is None:
             raise NotImplementedError(
-                f"this function '{node.text}' was not implemented yet"
+                f"this function '{node.text}' was not implemented"
             )
 
         yield func
         yield from self.parse_expression(node.find({"tag": "kParenGroup"}))
 
-    def parse_expression(self, node, width=None):
+    def parse_expression(self, node: BranchNode, width: int = None):
         if not node:
             return
         for child in node.children:
             if child.tag == "kNumber":
+                # a literal
                 yield self.parse_number(child.text, width)
             elif child.tag == "TK_RealTime":
+                # a literal
                 yield float(child.text)
             elif child.tag == "kReference":
+                # refernce a parameter or a define
                 id_node = child.find({"tag": ["SymbolIdentifier", "MacroIdentifier"]})
                 if id_node.tag == "SymbolIdentifier":
                     value = self.params.get(id_node.text, None)
                 elif id_node.tag == "MacroIdentifier":
                     value = self.defines.get(id_node.text.replace("`", ""), None)
                 else:
-                    value = None
+                    raise NotImplementedError
+                if value is None:
+                    raise ValueError(f"No such parameter or define: {id_node.text}")
                 yield value
-            # elif child.tag == "kDataTypePrimitive":
-            #     yield from self.parse_expression(child)
             elif child.tag == "kConditionExpression":
+                # conditional expression = a ? b : c
                 yield self.visit_conditional_expression(child)
             elif child.tag == "kDimensionRange":
+                # parse [31:0] or [ADDR-1:0]
                 yield from self.visit_dimension_range(child)
-
             elif child.tag in ("kFunctionCall", "kSystemTFCall"):
                 yield from self.visit_func_call(child)
-
             elif isinstance(child, LeafNode):
                 yield remap_syntax.get(child.text, child.text)
             else:
@@ -433,10 +447,6 @@ class VerilogModuleParser(VerilogASTCompiler):
 
     def process_module_tree(self, module_tree):
 
-        # Find module header
-        # header = module_tree.find({"tag": "kModuleHeader"})
-        # if not header:
-        #     raise ValueError("ModuleHeader is missing")
         header, module_name = self.get_module_header_and_name(module_tree)
 
         self.module_name = module_name
@@ -506,34 +516,36 @@ class VerilogModuleParser(VerilogASTCompiler):
                     if name not in self.params:
                         self.params[name] = value
 
-    def visit_port_declaration_list(self, moduleHeader):
+    def visit_port_declaration_list(
+        self, moduleHeader: BranchNode
+    ) -> Iterator[BranchNode]:
         PortDeclarationListTag = {"tag": "kPortDeclarationList"}
         portlist = moduleHeader.find(PortDeclarationListTag)
+        if not portlist:
+            raise ValueError("failed to locate port declaration list")
 
         for port in portlist.children:
             if port.tag == "kPreprocessorBalancedPortDeclarations":
-                yield from self.visit_pp_node(
-                    port,
-                    self.visit_port_declaration_list,
-                    tag=PortDeclarationListTag,
-                )
+                for child in self.visit_pp_node(port):
+                    yield from self.visit_port_declaration_list(
+                        child.find(PortDeclarationListTag)
+                    )
             elif port.tag in ("kPort", "kPortDeclaration"):
                 yield port
 
-    def visit_module_item_list(self, moduleBody):
+    def visit_module_item_list(self, moduleBody: BranchNode):
         for child in moduleBody.children:
             if child.tag == "kParamDeclaration":
                 yield child
             elif child.tag == "kModulePortDeclaration":
                 yield child
             elif child.tag == "kPreprocessorBalancedModuleItems":
-                yield from self.visit_pp_node(
-                    child,
-                    self.visit_module_item_list,
-                    tag={"tag": "kModuleItemList"},
-                )
+                for grandchild in self.visit_pp_node(child):
+                    yield from self.visit_module_item_list(
+                        grandchild.find({"tag": "kModuleItemList"})
+                    )
 
-    def visit_parameter_list(self, parameterList):
+    def visit_parameter_list(self, parameterList: BranchNode):
         if not parameterList:
             return
         for child in parameterList.children:
@@ -545,7 +557,7 @@ class VerilogModuleParser(VerilogASTCompiler):
                 )
 
 
-def verible_verilog_parser(filename: str) -> Optional[Mapping[str, SyntaxData]]:
+def get_verible_verilog_parser() -> VeribleVerilogSyntax:
     parser_path = (
         Path(__file__).parent.resolve().parent
         / "verible"
@@ -555,5 +567,4 @@ def verible_verilog_parser(filename: str) -> Optional[Mapping[str, SyntaxData]]:
     )
     if not parser_path.exists():
         raise FileNotFoundError(parser_path)
-    parser = VeribleVerilogSyntax(executable=str(parser_path))
-    return parser.parse_file(filename, {"skip_null": True, "gen_rawtokens": False})
+    return VeribleVerilogSyntax(executable=str(parser_path))

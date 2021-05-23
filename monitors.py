@@ -1,6 +1,6 @@
 from generic import iter_collect_files
 from pathlib import Path
-from typing import Generator, List, Callable, Mapping, Union
+from typing import Generator, List, Callable, Mapping, Tuple, Union
 import logging
 
 # from generic import get_now, iglob, iter_filelist_reader
@@ -57,7 +57,7 @@ class MonitorBase:
     def get_status(self) -> Mapping[str, float]:
         raise NotImplementedError
 
-    def iter_diff(self, verbose=True) -> Generator[Path, None, None]:
+    def iter_diff(self, verbose=True) -> Generator[Tuple[str, Path], None, None]:
         before = self.before
         after = self.get_status()
         events = {
@@ -81,7 +81,7 @@ class MonitorBase:
 
     def verbose(self, event, item, before, after):
         self.logger.info(
-            " | {0} | {1}".format(
+            " {0} | {1}".format(
                 event.upper(),
                 item,
             )

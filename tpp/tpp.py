@@ -7,7 +7,7 @@ from pathlib import Path
 from mako.template import Template
 from mako import exceptions
 from mako.lookup import TemplateLookup
-from .vpp.vpp import VerilogModule
+from .vpp.vpp import VerilogModule, tie0, tie_max, ASSIGN, TIE
 
 from . import filters
 
@@ -16,7 +16,6 @@ import time
 import re
 import os
 import yaml
-import sys
 import argparse
 import tempfile
 
@@ -197,7 +196,7 @@ def render(
         logger.error(msg) if logger else print(msg)
 
 
-def main():
+def app():
     argv = parse_args()
 
     ### setup a root logger
@@ -220,6 +219,10 @@ def main():
     _globals = dict(getmembers(filters, isfunction))
     _globals.update(imports.modules)
     _globals["VerilogModule"] = VerilogModule
+    _globals["TIE"] = TIE
+    _globals["ASSIGN"] = ASSIGN
+    _globals["tie0"] = tie0
+    _globals["tie_max"] = tie_max
     _globals["defines"] = dict(argv.defines)
     if argv.globals:
         with argv.globals.open("r") as fo:
@@ -303,7 +306,3 @@ def main():
                     f"{e}: Unexpected erros, please contact the author"
                 )
                 return 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())

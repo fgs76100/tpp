@@ -8,6 +8,7 @@ from pathlib import Path
 from fnmatch import fnmatch
 from typing import (
     Iterator,
+    Tuple,
     TypedDict,
     Union,
     Callable,
@@ -19,20 +20,22 @@ from .core import (
     VerilogModuleParser,
     VerilogModulePort,
     VerilogPreprocessor,
+    ASSIGNMENT,
     get_verible_verilog_parser,
     USER_DEFINED_FUNCTIONS,
     PARAMS,
 )
 from .verible_verilog_syntax import BranchNode
 
+
 INDENT: int = 2
 UNCONNECTED: int = 0
 INTERFACE: int = 1
-IO_CONNECT = Union[Dict[str, str], Callable[[str], Optional[str]]]
+IO_CONNECT = Union[Dict[str, Union[ASSIGNMENT, str]], Callable[[str], Optional[str]]]
 PATTERN = Union[List[str], str, Callable[[str], bool]]
 
 
-def connect(string: str, repl: IO_CONNECT) -> Optional[str]:
+def connect(string: str, repl: IO_CONNECT) -> Union[str, None, ASSIGNMENT, int]:
     new = None
     if callable(repl):
         new = repl(string)
@@ -46,6 +49,20 @@ class IO(TypedDict, total=False):
     suffix: str
     prefix: str
     connect: IO_CONNECT
+
+
+class ASSIGN(ASSIGNMENT):
+    def __init__(self, wire_name: str, value=Union[int, str]) -> None:
+        super().__init__(wire_name, value, "assign")
+
+
+class TIE(ASSIGNMENT):
+    def __init__(self, value=Union[int, str]) -> None:
+        super().__init__("", value, "tie")
+
+
+tie0 = TIE(0)
+tie_max = TIE("'1")
 
 
 class VerilogModule(VerilogModuleParser):
@@ -85,6 +102,7 @@ class VerilogModule(VerilogModuleParser):
     def iter_ports(
         self,
         io: IO = None,
+        direction: str = "",
         ignores: PATTERN = None,
         patterns: PATTERN = None,
         regxp: bool = False,
@@ -95,6 +113,7 @@ class VerilogModule(VerilogModuleParser):
         io_suffix = io["suffix"]
         io_prefix = io["prefix"]
         io_mode = io["mode"]
+        direction = direction.lower()
 
         def _match(patterns: PATTERN, string: str) -> bool:
             if isinstance(patterns, str):
@@ -109,44 +128,54 @@ class VerilogModule(VerilogModuleParser):
             return False
 
         for port in self.ports.values():
+            if direction and port.direction != direction:
+                continue
             if ignores and _match(ignores, port.name):
                 continue
             if patterns and not _match(patterns, port.name):
                 continue
             wire_name = connect(port.name, repl=io_connect)
-            if wire_name is not None:
-                port.conn(wire_name)
-            else:
+            if isinstance(wire_name, int):
+                wire_name = TIE(wire_name)
+
+            if wire_name is None:
                 port.unconn()
                 if io_mode == INTERFACE:
-                    port.wire_name = f"{io_prefix}{port.name}{io_suffix}"
+                    port.wire = f"{io_prefix}{port.name}{io_suffix}"
                 else:
-                    port.wire_name = f"NC__{port.name}"
+                    port.wire = f"NC__{port.name}"
+            else:
+                port.conn(wire_name)
 
             yield port
 
-    def iter_declarations(self, data_type: str, ignores: List[str] = None):
+    def iter_declarations(
+        self, data_type: str, ignores: List[str] = None, io: IO = None
+    ) -> Iterator[Tuple[str, str]]:
         max_len_dimension = max(
             map(
                 lambda x: len(str(x.data_type.to_declaration(data_type))),
                 self.iter_ports(),
             )
         )
-        for port in self.iter_ports(ignores=ignores):
+        for port in self.iter_ports(ignores=ignores, io=io):
+            if port.is_tied:
+                continue
             if (
                 self.io["mode"] == UNCONNECTED
                 and port.direction == "input"
                 and port.is_unconnected
             ):
-                yield f"{port.to_declaration(data_type, max_len_dimension)} = {port.data_type.size}'h0;"
+                # yield f"{port.to_declaration(data_type, max_len_dimension)}", f"{port.data_type.size}'h0;"
+                yield f"{port.to_declaration(data_type, max_len_dimension)}"
             else:
                 yield f"{port.to_declaration(data_type, max_len_dimension)};"
 
-    def io_to_wires(self, ignores: List[str] = None) -> str:
-        return "\n".join(self.iter_declarations("wire", ignores))
+    def io_to_wires(self, ignores: List[str] = None, io: IO = None) -> str:
+        return "\n".join(self.iter_declarations("wire", ignores, io))
 
-    def io_to_logics(self, ignores: List[str] = None) -> str:
-        return "\n".join(self.iter_declarations("logic", ignores))
+    def io_to_logics(self, ignores: List[str] = None, io: IO = None) -> str:
+        return "\n".join(self.iter_declarations("logic", ignores, io))
 
     def render_interface(
         self,
@@ -160,36 +189,39 @@ class VerilogModule(VerilogModuleParser):
         )
         indent = indent * " "
         sep = ",\n"
-        max_len_dir = max(map(lambda x: len(x.direction), self.ports.values())) + 2
-        max_len_dim = max(map(lambda x: len(str(x.data_type)), self.ports.values())) + 2
+        max_len_dir = max(map(lambda x: len(x.direction), self.ports.values()))
+        max_len_dim = max(map(lambda x: len(str(x.data_type)), self.ports.values()))
         ports = sep.join(
-            f"{indent}{port.direction:<{max_len_dir}} "
-            f"{port.data_type:<{max_len_dim}} "
+            f"{indent}{port.direction:<{max_len_dir}}  "
+            f"{port.data_type:>{max_len_dim}}  "
             f"{port.get_wire_name()}"
             for port in self.iter_ports(io=io, ignores=ignores)
             if (port.is_unconnected and io_mode == INTERFACE)
-            or (include_connected and not port.is_unconnected)
+            or (include_connected and not port.is_unconnected and not port.is_tied)
         )
         return ports
 
     def render_params(self, indent: int = INDENT) -> str:
         indent = indent * " "
         sep = ",\n"
-        params = sep.join(
-            f"{indent}parameter {k} = {v}" for k, v in self.params.items()
-        )
-        return params
+        if self.params:
+            params = sep.join(
+                f"{indent}parameter {k} = {v}" for k, v in self.params.items()
+            )
+            return f"#(\n" f"{params}\n" f")"
+        else:
+            return ""
 
     def render_moduleHeader(
         self,
+        name,
         indent: int = INDENT,
         io: IO = None,
         include_connected: bool = False,
     ) -> str:
         return (
-            f"module {self.module_name} #(\n"
-            f"{self.render_params(indent)}\n"
-            f") (\n"
+            f"module {name}"
+            f" {self.render_params(indent)} (\n"
             f"{self.render_interface(indent, io=io, include_connected=include_connected)}\n"
             f");\n"
         )
@@ -207,7 +239,7 @@ class VerilogModule(VerilogModuleParser):
         max_len_wire = max(
             map(
                 lambda x: len(x.get_wire_name()),
-                self.iter_ports(io=io),
+                self.iter_ports(io=io, ignores=ignores),
             )
         )
 

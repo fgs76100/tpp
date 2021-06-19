@@ -56,20 +56,20 @@ def _debug(node):
 
 
 class DataType:
-    def __init__(
-        self, data_type: str, dimensions: List[int], default_width: int = None
-    ):
+    def __init__(self, data_type: str, dimensions: List[int]):
         if not isinstance(dimensions, list):
             raise TypeError("expecting a list type")
 
         self.data_type = data_type or ""
+        if self.data_type in ("reg", "wire", "logic"):
+            self.data_type = ""
         assert isinstance(self.data_type, str), "expect a string type"
-        if default_width is not None:
-            self.dimensions = dimensions or [default_width - 1, 0]
-        else:
-            self.dimensions = dimensions
+        # if default_width is not None:
+        #     self.dimensions = dimensions or [default_width - 1, 0]
+        # else:
+        self.dimensions = dimensions
 
-        # self.default_width = default_width
+        self.default_width = 32  # TODO: implement this by data type
 
     def __repr__(self):
         return self.__str__()
@@ -78,22 +78,26 @@ class DataType:
         return self.data_type != "" or not self.is_unsize
 
     def __str__(self):
-        data_type = self.data_type
-        if self.size < 2:
-            return data_type
-        if data_type:
-            data_type += " "
-        return f"{data_type}[{self.msb}:{self.lsb}]"
+        # data_type = self.data_type
+        # if self.size < 2:
+        #     return data_type
+        # if data_type:
+        #     data_type += " "
+        # return f"{data_type}[{self.msb}:{self.lsb}]"
+        return self.to_declaration("")
 
     def to_declaration(self, user_data_type):
-        if isinstance(self.data_type, tuple):
-            data_type = " ".join(self.data_type)
-        else:
-            data_type = self.data_type or user_data_type
+        # if isinstance(self.data_type, tuple):
+        #     data_type = " ".join(self.data_type)
+        # else:
+        # data_type = user_data_type or self.data_type
+        data_type = self.data_type or user_data_type
         if self.size < 2:
-            return str(data_type)
+            return data_type
         else:
-            return f"{data_type} [{self.msb}:{self.lsb}]"
+            if data_type:
+                data_type += " "
+            return f"{data_type}[{self.msb}:{self.lsb}]"
 
     def __len__(self):
         return self.size
@@ -135,17 +139,33 @@ class DataType:
         return len(self.dimensions) == 0
 
 
+class ASSIGNMENT:
+    def __init__(self, wire_name: str, value: Union[int, str], _type: str):
+        self.wire_name = wire_name
+        self.value = value
+        self._type = _type
+
+    def __str__(self):
+        return self.wire_name
+
+    def __len__(self):
+        return len(self.wire_name)
+
+    def __format__(self, format_spec):
+        return format(self.__str__(), format_spec)
+
+
 @dataclass
 class VerilogModulePort:
     name: str
     direction: str = "inout"
-    wire_name: str = None
-    data_type: DataType = None
+    wire: Union[ASSIGNMENT, str, None] = None
+    data_type: Optional[DataType] = None
     is_unconnected: bool = True
 
     def __post_init__(self):
         self.data_type = DataType("", []) if self.data_type is None else self.data_type
-        # self.wire_name = self.name if self.wire_name is None else self.wire_name
+        # self.wire = self.name if self.wire is None else self.wire
 
     def __str__(self):
         data_type = str(self.data_type)
@@ -157,13 +177,13 @@ class VerilogModulePort:
     def __repr__(self):
         return self.__str__()
 
-    def conn(self, wire_name):
+    def conn(self, wire: Union[str, ASSIGNMENT]):
         self.is_unconnected = False
-        self.wire_name = wire_name
+        self.wire = wire
 
     def unconn(self):
         self.is_unconnected = True
-        self.wire_name = None
+        self.wire = None
 
     @property
     def size(self):
@@ -181,11 +201,38 @@ class VerilogModulePort:
     def lsb(self):
         return self.data_type.lsb
 
-    def get_wire_name(self, default: str = None) -> str:
-        if self.wire_name is None:
-            return default if default is not None else self.name
+    @property
+    def is_tied(self):
+        return isinstance(self.wire, int) or (
+            isinstance(self.wire, ASSIGNMENT) and self.wire._type == "tie"
+        )
 
-        return self.wire_name
+    @property
+    def is_assigned(self):
+        return isinstance(self.wire, ASSIGNMENT) and self.wire._type == "assign"
+
+    def get_value(self) -> str:
+        if self.is_tied or self.is_assigned:
+            value = self.wire.value
+            if isinstance(value, int):
+                return f"{self.size}'h{value:0X}"
+            elif isinstance(value, str):
+                if value == "'1":
+                    return f"{self.size}'h{(1<<self.size)-1:0X}"
+                return value
+            else:
+                raise TypeError(type(value))
+        else:
+            raise ValueError(f"no value was specified: {self}")
+
+    def get_wire_name(self, default: str = None) -> str:
+        if self.wire is None:
+            return default if default is not None else self.name
+        if self.is_tied:
+            return self.get_value()
+        if self.is_assigned:
+            return self.wire.wire_name
+        return self.wire
 
     def to_declaration(self, type: str, align: int = 0):
         data_type = str(self.data_type)
@@ -465,17 +512,18 @@ class VerilogModuleParser(VerilogASTCompiler):
 
     def parse_parameter(self, node: BranchNode):
         name = node.find(IdentifierTag).text
+        # _debug(node)
         if node.find({"tag": "kTypeAssignment"}):
             # parameter type ID = value
             value = node.find({"tag": "kDataType"}).text
+            data_type = DataType("type", [])
         else:
             dimension = node.find({"tag": "kDeclarationDimensions"})
-            data_type = DataType("", list(self.parse_expression(dimension)), 32)
+            _type = node.find({"tag": "kTypeInfo"}).text or ""
+            data_type = DataType(_type, list(self.parse_expression(dimension)))
 
             expression = node.find({"tag": "kExpression"})
             value = self.eval_expr(self.parse_expression(expression, data_type.width))
-        # except:
-        #     raise SyntaxError(node.text)
         return name, value
 
     def visit_func_call(self, node: BranchNode):
@@ -603,6 +651,7 @@ class VerilogModuleParser(VerilogASTCompiler):
                     direction = module_item.children[0].text
                     _type_node = module_item.children[1]
                     if _type_node.tag == "kUnqualifiedId":
+                        # a user-defined type
                         data_type: str = _type_node.text
                         data_type = self.params.get(data_type, data_type)
                     elif isinstance(_type_node, TokenNode):

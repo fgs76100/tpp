@@ -1,14 +1,15 @@
 from typing import Tuple, List, Union
-from generic import iter_collect_files
-from monitors import FileMonitor, REMOVED
+from .generic import iter_collect_files
+from .monitors import FileMonitor, REMOVED, ImportedModulesMonitor
 from inspect import getmembers, isfunction
 from ast import literal_eval
 from pathlib import Path
 from mako.template import Template
 from mako import exceptions
 from mako.lookup import TemplateLookup
-from vpp.vpp import VerilogModule
-from imports import ImportModulesMonitor
+from .vpp.vpp import VerilogModule
+
+from . import filters
 
 import logging
 import time
@@ -16,7 +17,6 @@ import re
 import os
 import yaml
 import sys
-import filters
 import argparse
 import tempfile
 
@@ -52,7 +52,7 @@ def tpp_preprocessor(source: str) -> str:
     return source
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(args=None) -> argparse.Namespace:
     def path_wrapper(pathname: str) -> Path:
         if not pathname:
             return None
@@ -121,7 +121,7 @@ def parse_args() -> argparse.Namespace:
         action="append",
         type=str,
         dest="imports",
-        help="import python file or package",
+        help="import python file or package. EX: --import 'import users_defined.py' --import 'users.my_func.py'",
     )
     parser.add_argument(
         "--incdir",
@@ -144,7 +144,10 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="show more informations",
     )
-    return parser.parse_args()
+    return parser.parse_args(args)
+
+
+singleton = {}
 
 
 def render(
@@ -159,21 +162,26 @@ def render(
         raise ExtensionError(uri)
 
     try:
-        tmp = Template(
-            # note that must use text instead of filename
-            # if lookup template locates at different folder
-            uri.open().read(),
-            uri=uri.name,
-            preprocessor=tpp_preprocessor,
-            lookup=lookup,
-            imports=imports,
-            strict_undefined=False,
-            # module_directory=lookup.module_directory,
-        )
+        if str(uri) in singleton:
+            tmp = singleton.get(str(uri))
+        else:
+            tmp = Template(
+                # note that must use text instead of filename
+                # if lookup template locates at another folder
+                uri.open().read(),
+                uri=uri.name,
+                preprocessor=tpp_preprocessor,
+                lookup=lookup,
+                imports=imports,
+                strict_undefined=False,
+                # module_directory=lookup.module_directory,
+            )
+            singleton[str(uri)] = tmp
+
         out = output_directory.joinpath(uri.stem)
         msg = f"{'generated'} | {out}"
         with out.open("w") as fo:
-            fo.write(tmp.render(store={}, **_globals))
+            fo.write(tmp.render(store={}, __file__=str(uri), **_globals))
         logger.info(msg) if logger else print(msg)
     except:
         sep = "\n"
@@ -208,7 +216,7 @@ def main():
         raise ValueError("User must specify at least one template source")
 
     ### setup global variables for template engine
-    imports = ImportModulesMonitor("\n".join(argv.imports))
+    imports = ImportedModulesMonitor("\n".join(argv.imports))
     _globals = dict(getmembers(filters, isfunction))
     _globals.update(imports.modules)
     _globals["VerilogModule"] = VerilogModule
@@ -266,7 +274,7 @@ def main():
         print('Running at development mode. Use "ctrl+c" to exit.')
         while True:
             try:
-                if imports.reload_modules():
+                if imports.try_reload_modules():
                     render_all()
 
                 for event, filename in lookup_monitor.iter_diff(verbose=False):

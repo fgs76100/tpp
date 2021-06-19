@@ -1,7 +1,7 @@
 import ast
 import importlib
 from typing import Callable, Generator, Optional, List, Mapping
-from monitors import MonitorBase
+from .monitors import MonitorBase
 from pathlib import Path
 from inspect import getmembers, ismodule
 

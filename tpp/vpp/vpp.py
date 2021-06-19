@@ -29,6 +29,7 @@ INDENT: int = 2
 UNCONNECTED: int = 0
 INTERFACE: int = 1
 IO_CONNECT = Union[Dict[str, str], Callable[[str], Optional[str]]]
+PATTERN = Union[List[str], str, Callable[[str], bool]]
 
 
 def connect(string: str, repl: IO_CONNECT) -> Optional[str]:
@@ -59,7 +60,7 @@ class VerilogModule(VerilogModuleParser):
     ):
         self.params_redefined = params.copy() if isinstance(params, dict) else {}
         self.instance_counts = 0
-        self.io: IO = dict(mode=INTERFACE, suffix="", prefix="", conn={})
+        self.io: IO = dict(mode=INTERFACE, suffix="", prefix="", connect={})
         if isinstance(io, dict):
             self.io.update(deepcopy(io))
         super().__init__(
@@ -84,8 +85,8 @@ class VerilogModule(VerilogModuleParser):
     def iter_ports(
         self,
         io: IO = None,
-        ignores: List[str] = None,
-        match: Union[str, Callable[[str], bool]] = None,
+        ignores: PATTERN = None,
+        patterns: PATTERN = None,
         regxp: bool = False,
     ) -> Iterator[VerilogModulePort]:
 
@@ -95,26 +96,23 @@ class VerilogModule(VerilogModuleParser):
         io_prefix = io["prefix"]
         io_mode = io["mode"]
 
-        # if isinstance(io, dict):
-        #     for port_name, wire_name in io_connect.items():
-        #         if port_name not in self.ports:
-        #             raise ValueError(
-        #                 f'No such port name "{port_name}" on the module "{self.module_name}"'
-        #             )
-        #         else:
-        #             self.ports[port_name].conn(wire_name)
+        def _match(patterns: PATTERN, string: str) -> bool:
+            if isinstance(patterns, str):
+                if not regxp:
+                    return fnmatch(string, patterns)
+                if regxp:
+                    return re.match(patterns, string)
+            if callable(patterns):
+                return patterns(string)
+            if isinstance(patterns, list):
+                return any(filter(lambda p: _match(p, string), patterns))
+            return False
 
         for port in self.ports.values():
-            if ignores and port.name in ignores:
+            if ignores and _match(ignores, port.name):
                 continue
-            if callable(match) and not match(port.name):
+            if patterns and not _match(patterns, port.name):
                 continue
-            if isinstance(match, str):
-                if not regxp and not fnmatch(port.name, match):
-                    continue
-                if regxp and not re.match(match, port.name):
-                    continue
-
             wire_name = connect(port.name, repl=io_connect)
             if wire_name is not None:
                 port.conn(wire_name)
@@ -265,7 +263,7 @@ class VerilogModule(VerilogModuleParser):
         file_data = parser.parse_file(
             str(filepath), {"skip_null": True, "gen_rawtokens": False}
         )
-        pp = VerilogPreprocessor(file_data, defines=defines)
+        pp = VerilogPreprocessor(str(filepath), file_data, defines=defines)
         for module in pp.walk_root():
             _, name = cls.get_module_header_and_name(module)
             if modulename == name:
@@ -297,7 +295,7 @@ class VerilogModule(VerilogModuleParser):
         file_data = parser.parse_string(
             string, {"skip_null": True, "gen_rawtokens": False}
         )
-        pp = VerilogPreprocessor(file_data, defines)
+        pp = VerilogPreprocessor("from_string", file_data, defines)
         for module in pp.walk_root():
             if modulename:
                 _, name = cls.get_module_header_and_name(module)

@@ -14,7 +14,17 @@ import anytree
 import math
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Callable, Generator, Iterator, Optional, Tuple, Dict, Union
+from typing import (
+    Callable,
+    Generator,
+    Iterable,
+    Iterator,
+    Optional,
+    Tuple,
+    Dict,
+    Union,
+    List,
+)
 from types import ModuleType
 from inspect import getmembers, isfunction
 
@@ -40,12 +50,20 @@ remap_sysetmTF = {
 _globals = {"clog2": lambda value: math.ceil(math.log2(float(value)))}
 
 
+def _debug(node):
+    for prefix, _, child in anytree.RenderTree(node):
+        print(prefix, child.to_formatted_string())
+
+
 class DataType:
-    def __init__(self, data_type, dimensions: list, default_width: int = None):
+    def __init__(
+        self, data_type: str, dimensions: List[int], default_width: int = None
+    ):
         if not isinstance(dimensions, list):
             raise TypeError("expecting a list type")
 
         self.data_type = data_type or ""
+        assert isinstance(self.data_type, str), "expect a string type"
         if default_width is not None:
             self.dimensions = dimensions or [default_width - 1, 0]
         else:
@@ -60,10 +78,7 @@ class DataType:
         return self.data_type != "" or not self.is_unsize
 
     def __str__(self):
-        if not isinstance(self.data_type, str):
-            data_type = " ".join(self.data_type)
-        else:
-            data_type = self.data_type
+        data_type = self.data_type
         if self.size < 2:
             return data_type
         if data_type:
@@ -85,6 +100,10 @@ class DataType:
 
     def __format__(self, format_spec):
         return format(self.__str__(), format_spec)
+
+    @property
+    def type(self):
+        return self.data_type
 
     @property
     def msb(self):
@@ -146,6 +165,22 @@ class VerilogModulePort:
         self.is_unconnected = True
         self.wire_name = None
 
+    @property
+    def size(self):
+        return self.data_type.size
+
+    @property
+    def type(self):
+        return self.data_type.type
+
+    @property
+    def msb(self):
+        return self.data_type.msb
+
+    @property
+    def lsb(self):
+        return self.data_type.lsb
+
     def get_wire_name(self, default: str = None) -> str:
         if self.wire_name is None:
             return default if default is not None else self.name
@@ -167,6 +202,9 @@ class VerilogModulePort:
 
     def to_logic(self, align: int = 0):
         return self.to_declaration("logic", align)
+
+    def to_reg(self, align: int = 0):
+        return self.to_declaration("reg", align)
 
 
 verilog_number = re.compile(r"(\+-)?(\d*)'([hbodHBOD])?([0-9a-fA-F_]+)")
@@ -226,6 +264,8 @@ class VerilogASTCompiler:
         elif fmt == "":
             # reg = '0 or '1 -> all bits of "register" be zero or one
             # if data_type width is undefine, assume dimension_width = 1 (base on IEEE1800-2017)
+            if dimension_width == 0:
+                raise ValueError("diemension should large than 0")
             dimension_width = dimension_width or 1
             return int(value * dimension_width, 2)
         else:
@@ -273,8 +313,17 @@ class VerilogPreprocessor(VerilogASTCompiler):
     any preprocssor statements(or compiler directives) inside the module declaration will be ignored
     """
 
-    def __init__(self, data: SyntaxData, defines: PARAMS = None):
+    def __init__(self, filepath: str, data: SyntaxData, defines: PARAMS = None):
         self.data = data
+        self.filepath = filepath
+        if self.data.errors:
+            raise SyntaxError(
+                "\n"
+                + "\n".join(
+                    f"{filepath}:{error.line}:{error.column}: syntax error, {error.text}"
+                    for error in self.data.errors
+                )
+            )
         self.defines = defines or {}
 
     def walk_root(self) -> Generator[BranchNode, None, None]:
@@ -318,6 +367,7 @@ class VerilogPreprocessor(VerilogASTCompiler):
     def from_string(cls, string: str, defines: PARAMS = None):
         parser = get_verible_verilog_parser()
         return cls(
+            "from_string",
             parser.parse_string(string, {"skip_null": True, "gen_rawtokens": False}),
             defines,
         )
@@ -326,6 +376,7 @@ class VerilogPreprocessor(VerilogASTCompiler):
     def from_file(cls, filepath: str, defines: PARAMS = None):
         parser = get_verible_verilog_parser()
         return cls(
+            filepath,
             parser.parse_file(filepath, {"skip_null": True, "gen_rawtokens": False}),
             defines,
         )
@@ -334,13 +385,14 @@ class VerilogPreprocessor(VerilogASTCompiler):
 class VerilogModuleParser(VerilogASTCompiler):
     def __init__(
         self,
-        file_path: str,
+        filepath: str,
         module_tree: BranchNode,
         defines: PARAMS = None,
         params: PARAMS = None,
         user_defined_functions: USER_DEFINED_FUNCTIONS = None,
     ):
-        self.file_path = file_path
+        self.data = module_tree
+        self.filepath = filepath
         self.defines = defines or {}
         self.ports: Dict[str, VerilogModulePort] = {}
         self.module_name: str = None
@@ -350,10 +402,12 @@ class VerilogModuleParser(VerilogASTCompiler):
             )
         elif isinstance(user_defined_functions, dict):
             self.user_defined_functions = user_defined_functions.copy()
-        else:
+        elif user_defined_functions:
             raise NotImplementedError(
                 f"user_defined_functions should be a moulde or dict, got f{type(user_defined_functions)} instead"
             )
+        else:
+            self.user_defined_functions = {}
 
         if isinstance(params, dict):
             self.params = params.copy()
@@ -362,14 +416,14 @@ class VerilogModuleParser(VerilogASTCompiler):
 
         self.process_module_tree(module_tree)
 
-    def eval_expr(self, expr: str):
+    def eval_expr(self, expr: Iterable):
         if not expr:
             return
         expr = "".join(map(str, expr))
         try:
             value = eval(expr, _globals, self.user_defined_functions)
         except SyntaxError:
-            raise SyntaxError(expr)
+            raise SyntaxError(expr or "got empty string")
         if isinstance(value, float):
             return math.ceil(value)
         return value
@@ -378,20 +432,27 @@ class VerilogModuleParser(VerilogASTCompiler):
         # conditional_expression ::=
         # cond_predicate ? { attribute_instance  } expression : expression
         expr = []
-        for child in node.children:
-            if isinstance(child, TokenNode):
+        for index, child in enumerate(node.children):
+            # node.children should be = [expr, ?, expr, :, expr]
+            # so only parse child if index is even number,
+            if index % 2:  # index is odd number
                 continue
             node = self.parse_expression(child)
             expr.append(self.eval_expr(node))
 
-        assert len(expr) == 3, "expecting [cond_predicate, expression, expression]"
+        assert (
+            len(expr) == 3
+        ), f"expecting [cond_predicate, expression, expression], got {expr}"
         cond_predicate = expr[0]
         assert isinstance(
             cond_predicate, bool
         ), "expecting cond_predicate been evaluated to a boolean type"
         left_expr = expr[1]
         right_expr = expr[2]
-        return left_expr if cond_predicate else right_expr
+        result = left_expr if cond_predicate else right_expr
+        if isinstance(result, str):
+            return f"'{result}'"
+        return result
 
     def visit_dimension_range(self, node: BranchNode):
         if not node:
@@ -404,11 +465,17 @@ class VerilogModuleParser(VerilogASTCompiler):
 
     def parse_parameter(self, node: BranchNode):
         name = node.find(IdentifierTag).text
-        dimension = node.find({"tag": "kDeclarationDimensions"})
-        data_type = DataType("", list(self.parse_expression(dimension)), 32)
+        if node.find({"tag": "kTypeAssignment"}):
+            # parameter type ID = value
+            value = node.find({"tag": "kDataType"}).text
+        else:
+            dimension = node.find({"tag": "kDeclarationDimensions"})
+            data_type = DataType("", list(self.parse_expression(dimension)), 32)
 
-        expression = node.find({"tag": "kExpression"})
-        value = self.eval_expr(self.parse_expression(expression, data_type.width))
+            expression = node.find({"tag": "kExpression"})
+            value = self.eval_expr(self.parse_expression(expression, data_type.width))
+        # except:
+        #     raise SyntaxError(node.text)
         return name, value
 
     def visit_func_call(self, node: BranchNode):
@@ -430,37 +497,43 @@ class VerilogModuleParser(VerilogASTCompiler):
     def parse_expression(self, node: BranchNode, width: int = None):
         if not node:
             return
-        for child in node.children:
-            if child.tag == "kNumber":
+        try:
+            # for node in node.noderen:
+            if node.tag == "kNumber":
                 # a iteral
-                yield self.parse_number(child.text, width)
-            elif child.tag == "TK_RealTime":
+                yield self.parse_number(node.text, width)
+            elif node.tag == "TK_RealTime":
                 # a iteral
-                yield float(child.text)
-            elif child.tag == "kReference":
+                yield float(node.text)
+            elif node.tag == "TK_StringLiteral":
+                yield f"'{node.text}'"
+            elif node.tag == "kReference":
                 # refernce a parameter or a define
-                id_node = child.find({"tag": ["SymbolIdentifier", "MacroIdentifier"]})
+                id_node = node.find({"tag": ["SymbolIdentifier", "MacroIdentifier"]})
                 if id_node.tag == "SymbolIdentifier":
                     value = self.params.get(id_node.text, None)
                 elif id_node.tag == "MacroIdentifier":
                     value = self.defines.get(id_node.text.replace("`", ""), None)
                 else:
-                    raise NotImplementedError
+                    raise NotImplementedError(id_node.tag)
                 if value is None:
                     raise ValueError(f"No such parameter or define: {id_node.text}")
                 yield value
-            elif child.tag == "kConditionExpression":
+            elif node.tag == "kConditionExpression":
                 # conditional expression = a ? b : c
-                yield self.visit_conditional_expression(child)
-            elif child.tag == "kDimensionRange":
+                yield self.visit_conditional_expression(node)
+            elif node.tag == "kDimensionRange":
                 # parse [31:0] or [ADDR-1:0]
-                yield from self.visit_dimension_range(child)
-            elif child.tag in ("kFunctionCall", "kSystemTFCall"):
-                yield from self.visit_func_call(child)
-            elif isinstance(child, LeafNode):
-                yield remap_syntax.get(child.text, child.text)
+                yield from self.visit_dimension_range(node)
+            elif node.tag in ("kFunctionCall", "kSystemTFCall"):
+                yield from self.visit_func_call(node)
+            elif isinstance(node, LeafNode):
+                yield remap_syntax.get(node.text, node.text)
             else:
-                yield from self.parse_expression(child)
+                for child in node.children:
+                    yield from self.parse_expression(child, width)
+        except:
+            raise NotImplementedError(node.text)
 
     @staticmethod
     def get_module_header_and_name(module) -> Tuple[BranchNode, str]:
@@ -496,24 +569,29 @@ class VerilogModuleParser(VerilogASTCompiler):
             port_id = port.find(IdentifierTag).text
             self.ports[port_id] = VerilogModulePort(name=port_id)
 
+            # _debug(port)
             if port.tag == "kPortDeclaration":
                 direction = port.find(lambda x: isinstance(x, TokenNode)).text
                 data_type = port.find({"tag": ["kDataType"]})
                 interface = data_type.find({"tag": ["kInterfacePortHeader"]})
                 if interface:
                     direction = interface.text
-                    data_type = ""
+                    data_type_id = ""
                     dimension = []
                 else:
+                    data_type_id = ""
+                    for child in data_type.children:
+                        if child.tag == "kDataTypePrimitive":
+                            data_type_id = child.text
+                        elif child.tag == "kUnqualifiedId":
+                            data_type_id = child.text
+                            data_type_id = self.params.get(data_type_id, data_type_id)
+
                     dimension = data_type.find({"tag": ["kDeclarationDimensions"]})
-                    data_type = data_type.find(
-                        {"tag": ["kDataTypePrimitive", "kUnqualifiedId"]}
-                    )
-                    data_type = tuple(self.parse_expression(data_type))
                     dimension = list(self.parse_expression(dimension))
 
                 self.ports[port_id].direction = direction
-                self.ports[port_id].data_type = DataType(data_type, dimension)
+                self.ports[port_id].data_type = DataType(str(data_type_id), dimension)
 
         if not is_ansi_sytle:
             body = module_tree.find({"tag": "kModuleItemList"})
@@ -523,10 +601,16 @@ class VerilogModuleParser(VerilogASTCompiler):
             for module_item in self.visit_module_item_list(body):
                 if module_item.tag == "kModulePortDeclaration":
                     direction = module_item.children[0].text
-                    if module_item.children[1].tag == "kUnqualifiedId":
-                        data_type = (module_item.children[1].text,)  # make it a tuple
+                    _type_node = module_item.children[1]
+                    if _type_node.tag == "kUnqualifiedId":
+                        data_type: str = _type_node.text
+                        data_type = self.params.get(data_type, data_type)
+                    elif isinstance(_type_node, TokenNode):
+                        data_type: str = _type_node.text
+                        if data_type == "wire":
+                            data_type = ""  # here we drop wire type
                     else:
-                        data_type = ""
+                        data_type: str = ""
                     dimension = module_item.find({"tag": ["kDeclarationDimensions"]})
                     name = module_item.find(
                         {

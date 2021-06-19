@@ -391,7 +391,7 @@ class Error:
     line: int
     column: int
     phase: str
-    message: str = ""
+    text: str = ""
 
 
 @dataclasses.dataclass
@@ -452,8 +452,7 @@ class VeribleVerilogSyntax:
     @staticmethod
     def _transform_errors(tokens) -> List[Error]:
         return [
-            Error(t["line"], t["column"], t["phase"], t.get("message", None))
-            for t in tokens
+            Error(t["line"], t["column"], t["phase"], t.get("text", "")) for t in tokens
         ]
 
     def _parse(
